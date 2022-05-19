@@ -55,11 +55,14 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
             + "[policy_definition]\n"
             + "p = subject, domain, object, action, scope\n"
             + "\n"
+            + "[role_definition]\n"
+            +"g = _, _, _\n"
+            + "\n"
             + "[policy_effect]\n"
             + "e = some(where (p.eft == allow))\n"
             + "\n"
             + "[matchers]\n"
-            + "m = r.subject == p.subject && r.domain == p.domain && r.object == p.object && "
+            + "m = g(r.subject, p.subject, r.domain) && r.domain == p.domain && r.object == p.object && "
             + "keyMatch(r.action, p.action) && keyMatch(r.scope, p.scope)";
     private AsyncLoadingCache<String, Optional<SyncedEnforcer>> enforcerCache;
     private final ObjectMapper mapper = new ObjectMapper();
