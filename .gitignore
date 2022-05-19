@@ -1,0 +1,21 @@
+# Eclipse
+.classpath
+.project
+.settings/
+.recommenders/
+
+# Intellij
+.idea/
+*.iml
+*.iws
+
+# NetBeans
+/**/nb-configuration.xml
+
+# Mac
+.DS_Store
+
+# Gradle
+.gradle/
+build/
+target/
