@@ -1,9 +1,9 @@
 FROM apachepulsar/pulsar:latest
 
-COPY target/*.jar /pulsar/lib/
+COPY target/*-shade.jar /pulsar/lib/
 COPY integration-test/my-secret.key /pulsar/conf/
 
-COPY integration-test/entrypoint.sh /
-RUN chmod +x /entrypoint.sh
+RUN mkdir /pulsar/casbin-test
+COPY integration-test/entrypoint.sh /pulsar/casbin-test/
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/pulsar/casbin-test/entrypoint.sh"]

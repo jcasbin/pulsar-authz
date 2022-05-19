@@ -29,14 +29,15 @@ import org.apache.logging.log4j.util.Strings;
 import org.apache.pulsar.broker.ServiceConfiguration;
 import org.apache.pulsar.broker.authentication.AuthenticationDataSource;
 import org.apache.pulsar.broker.cache.ConfigurationCacheService;
+import org.apache.pulsar.broker.resources.PulsarResources;
 import org.apache.pulsar.common.naming.NamespaceName;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.policies.data.AuthAction;
+import org.apache.pulsar.common.policies.data.NamespaceOperation;
 import org.apache.pulsar.common.policies.data.PolicyName;
 import org.apache.pulsar.common.policies.data.PolicyOperation;
 import org.apache.pulsar.common.policies.data.TenantOperation;
 import org.apache.pulsar.common.policies.data.TopicOperation;
-import org.apache.pulsar.common.util.FutureUtil;
 import org.apache.pulsar.metadata.api.MetadataStore;
 import org.casbin.jcasbin.main.SyncedEnforcer;
 import org.casbin.jcasbin.model.Model;
@@ -67,13 +68,38 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
     private AsyncLoadingCache<String, Optional<SyncedEnforcer>> enforcerCache;
     private final ObjectMapper mapper = new ObjectMapper();
 
-    @SneakyThrows
+    private Optional<MetadataStore> getConfigurationMetadataStore(String fieldName, Object object) {
+        try {
+            var field = object.getClass().getDeclaredField(fieldName);
+            field.setAccessible(true);
+            return (Optional<MetadataStore>) field.get(object);
+        } catch (Exception e) {
+            log.error("Cannot get the configurationMetadataStore", e);
+            return Optional.empty();
+        }
+    }
+
+    @Override
+    public void initialize(ServiceConfiguration conf, PulsarResources pulsarResources) {
+        newProvider(conf, getConfigurationMetadataStore("configurationMetadataStore", pulsarResources));
+    }
+
     @Override
     public void initialize(ServiceConfiguration conf, ConfigurationCacheService configCache) {
-        checkNotNull(conf, "ServiceConfiguration can't be null");
-        checkNotNull(conf, "ConfigurationCacheService can't be null");
+        newProvider(conf, getConfigurationMetadataStore("configurationMetadataStore", configCache));
+    }
+
+    @SneakyThrows
+    private void newProvider(ServiceConfiguration conf, Optional<MetadataStore> configurationMetadataStore) {
+        checkNotNull(conf, "ServiceConfiguration cannot be null");
+
+        final var metadataStoreError =
+                "ConfigurationMetadataStore cannot be null, this authorization provider requires MetadataStore support";
+
+        checkNotNull(configurationMetadataStore, metadataStoreError);
+
         config = conf;
-        metadataStore = configCache.getPulsarResources().getConfigurationMetadataStore().orElseThrow();
+        metadataStore = configurationMetadataStore.orElseThrow(() -> new IllegalArgumentException(metadataStoreError));
 
         var modelPath = StringUtils.defaultString((String) conf.getProperty("enforcerModelPath"));
         if (Strings.isNotEmpty(modelPath)) {
@@ -93,8 +119,8 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
         if (Strings.isNotEmpty(modelPath)) {
             this.metadataBasePath = metadataPath;
         }
-
         log.info("Enforcer metadata path: {}", metadataBasePath);
+
         enforcerCache = Caffeine.newBuilder()
                 .executor(MoreExecutors.directExecutor())
                 .buildAsync((subject, executor) -> loadEnforcer(subject));
@@ -118,7 +144,7 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
     }
 
     private CompletableFuture<Optional<SyncedEnforcer>> loadEnforcer(String subject) {
-        final String path = getSubjectPath(subject);
+        final var path = getSubjectPath(subject);
         return metadataStore.get(path).thenApply(res -> {
             if (res.isEmpty()) {
                 log.debug("No policy for subject {}", subject);
@@ -155,7 +181,7 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
 
     private CompletableFuture<Void> updatePolicy(String subject,
                                                  Function<Set<List<String>>, Set<List<String>>> updateFn) {
-        final String path = getSubjectPath(subject);
+        final var path = getSubjectPath(subject);
         return metadataStore.get(path).thenCompose(n -> {
             Set<List<String>> policy;
             if (n.isEmpty()) {
@@ -202,7 +228,7 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
                     log.error("Failed to enforce: {}", request);
                     return;
                 }
-                log.debug("Enforce: {} -> {}", request, ok);
+                log.info("Enforce: {} -> {}", request, ok);
             });
         });
     }
@@ -442,8 +468,6 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
                                                                String role,
                                                                TopicOperation operation,
                                                                AuthenticationDataSource authData) {
-        log.debug("Check allowTopicOperationAsync [" + operation.name() + "] on [" + topicName.toString() + "].");
-
         switch (operation) {
             case LOOKUP:
             case GET_STATS:
@@ -467,10 +491,8 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
             case ADD_BUNDLE_RANGE:
             case GET_BUNDLE_RANGE:
             case DELETE_BUNDLE_RANGE:
-                return enforceAsync(role, topicName, operation.name(), DEFAULT_SCOPE, authData);
             default:
-                return FutureUtil.failedFuture(
-                        new IllegalStateException("TopicOperation [" + operation.name() + "] is not supported."));
+                return enforceAsync(role, topicName, operation.name(), DEFAULT_SCOPE, authData);
         }
 
     }
@@ -483,6 +505,34 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
                                                                      AuthenticationDataSource authData) {
         return enforceAsync(role, topicName.getNamespaceObject().toString(), topicName.getPartitionedTopicName(),
                 policyName.name(), policyOperation.name(), authData);
+    }
+
+    @Override
+    public CompletableFuture<Boolean> allowNamespaceOperationAsync(NamespaceName namespaceName, String role,
+                                                                   NamespaceOperation operation,
+                                                                   AuthenticationDataSource authData) {
+        switch (operation) {
+            case PACKAGES:
+                return enforceAsync(role, namespaceName, AuthAction.packages.name(), DEFAULT_SCOPE, authData);
+            case GET_TOPIC:
+            case GET_TOPICS:
+            case GET_BUNDLE:
+                return enforceAsync(role, namespaceName, AuthAction.consume.name(), DEFAULT_SCOPE, authData)
+                        .thenCompose((n) -> enforceAsync(role, namespaceName, AuthAction.produce.name(), DEFAULT_SCOPE,
+                                authData));
+            case UNSUBSCRIBE:
+            case CLEAR_BACKLOG:
+                return enforceAsync(role, namespaceName, AuthAction.consume.name(), DEFAULT_SCOPE, authData);
+            case CREATE_TOPIC:
+            case DELETE_TOPIC:
+            case ADD_BUNDLE:
+            case DELETE_BUNDLE:
+            case GRANT_PERMISSION:
+            case GET_PERMISSION:
+            case REVOKE_PERMISSION:
+            default:
+                return enforceAsync(role, namespaceName, operation.name(), DEFAULT_SCOPE, authData);
+        }
     }
 
     /**
