@@ -21,6 +21,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import lombok.NonNull;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.io.IOUtils;
@@ -30,6 +31,7 @@ import org.apache.pulsar.broker.ServiceConfiguration;
 import org.apache.pulsar.broker.authentication.AuthenticationDataSource;
 import org.apache.pulsar.broker.cache.ConfigurationCacheService;
 import org.apache.pulsar.broker.resources.PulsarResources;
+import org.apache.pulsar.broker.resources.TenantResources;
 import org.apache.pulsar.common.naming.NamespaceName;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.policies.data.AuthAction;
@@ -44,12 +46,13 @@ import org.casbin.jcasbin.model.Model;
 
 @Slf4j
 public class AuthorizationProvider implements org.apache.pulsar.broker.authorization.AuthorizationProvider {
-    private static final String DEFAULT_SCOPE = "*";
+    private static final String DEFAULT_FILL = "*";
     private static final String TYPE_POLICY = "p";
     private static final String TYPE_GROUPING_POLICY = "g";
     private ServiceConfiguration config = null;
     private MetadataStore metadataStore;
-    private String metadataBasePath = "casbin";
+    private TenantResources tenantResources;
+    private String metadataBasePath = "/casbin";
     private String modelText = "[request_definition]\n"
             + "r = subject, domain, object, action, scope\n"
             + "\n"
@@ -57,7 +60,7 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
             + "p = subject, domain, object, action, scope\n"
             + "\n"
             + "[role_definition]\n"
-            +"g = _, _, _\n"
+            + "g = _, _, _\n"
             + "\n"
             + "[policy_effect]\n"
             + "e = some(where (p.eft == allow))\n"
@@ -68,9 +71,9 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
     private AsyncLoadingCache<String, Optional<SyncedEnforcer>> enforcerCache;
     private final ObjectMapper mapper = new ObjectMapper();
 
-    private Optional<MetadataStore> getConfigurationMetadataStore(String fieldName, Object object) {
+    private Optional<MetadataStore> getConfigurationMetadataStore(Object object) {
         try {
-            var field = object.getClass().getDeclaredField(fieldName);
+            var field = object.getClass().getDeclaredField("configurationMetadataStore");
             field.setAccessible(true);
             return (Optional<MetadataStore>) field.get(object);
         } catch (Exception e) {
@@ -79,27 +82,40 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
         }
     }
 
+    private TenantResources getTenantResources(Object object) {
+        try {
+            var field = object.getClass().getDeclaredField("tenantResources");
+            field.setAccessible(true);
+            return (TenantResources) field.get(object);
+        } catch (Exception e) {
+            log.error("Cannot get the tenantResources", e);
+            return null;
+        }
+    }
+
     @Override
     public void initialize(ServiceConfiguration conf, PulsarResources pulsarResources) {
-        newProvider(conf, getConfigurationMetadataStore("configurationMetadataStore", pulsarResources));
+        newProvider(conf, getConfigurationMetadataStore(pulsarResources), getTenantResources(pulsarResources));
     }
 
     @Override
     public void initialize(ServiceConfiguration conf, ConfigurationCacheService configCache) {
-        newProvider(conf, getConfigurationMetadataStore("configurationMetadataStore", configCache));
+        // NOTE: Not sure if it is fully compatible.
+        newProvider(conf, getConfigurationMetadataStore(configCache), getTenantResources(configCache));
     }
 
     @SneakyThrows
-    private void newProvider(ServiceConfiguration conf, Optional<MetadataStore> configurationMetadataStore) {
+    private void newProvider(ServiceConfiguration conf, Optional<MetadataStore> configurationMetadataStore,
+                             TenantResources tenantResources) {
         checkNotNull(conf, "ServiceConfiguration cannot be null");
-
         final var metadataStoreError =
                 "ConfigurationMetadataStore cannot be null, this authorization provider requires MetadataStore support";
-
         checkNotNull(configurationMetadataStore, metadataStoreError);
+        checkNotNull(tenantResources, "TenantResources cannot be null");
 
         config = conf;
         metadataStore = configurationMetadataStore.orElseThrow(() -> new IllegalArgumentException(metadataStoreError));
+        this.tenantResources = tenantResources;
 
         var modelPath = StringUtils.defaultString((String) conf.getProperty("enforcerModelPath"));
         if (Strings.isNotEmpty(modelPath)) {
@@ -112,12 +128,16 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
         }
 
         log.debug("Model text: {}", modelText);
-        // Verify the model
+        // Verify the model.
         new Model().loadModelFromText(modelText);
 
-        String metadataPath = StringUtils.defaultString((String) conf.getProperty("enforcerMetadataPath"));
+        String enforcerMetadataPath = StringUtils.defaultString((String) conf.getProperty("enforcerMetadataPath"));
         if (Strings.isNotEmpty(modelPath)) {
-            this.metadataBasePath = metadataPath;
+            if (modelPath.equals("/")) {
+                throw new IllegalArgumentException("enforcerMetadataPath cannot be equals '/'");
+            }
+            this.metadataBasePath =
+                    !enforcerMetadataPath.startsWith("/") ? "/" + enforcerMetadataPath : enforcerMetadataPath;
         }
         log.info("Enforcer metadata path: {}", metadataBasePath);
 
@@ -125,7 +145,23 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
                 .executor(MoreExecutors.directExecutor())
                 .buildAsync((subject, executor) -> loadEnforcer(subject));
 
-        // TODO: add listener the medata store
+        metadataStore.registerListener(notification -> {
+            var path = notification.getPath();
+
+            if (!path.startsWith(metadataBasePath) || path.equals(metadataBasePath)) {
+                return;
+            }
+
+            switch (notification.getType()) {
+                case Created:
+                case Deleted:
+                case Modified:
+                    var split = path.substring(1).split("/");
+                    var role = split[split.length - 1];
+                    log.info("{} path data has been changed, discard cache", path);
+                    enforcerCache.synchronous().invalidate(role);
+            }
+        });
 
         log.info("Initialized successfully");
     }
@@ -206,64 +242,82 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
         });
     }
 
-    private CompletableFuture<Boolean> enforceAsync(
-            String role,
-            String domain,
-            String object,
-            String action,
-            String scope,
-            AuthenticationDataSource authenticationData) {
-        return isSuperUser(role, authenticationData, config).thenCompose((n) -> {
-            if (n) {
+    private CompletableFuture<Boolean> internalEnforceAsync(
+            @NonNull String subject,
+            @NonNull String domain,
+            @NonNull String object,
+            @NonNull String action,
+            @NonNull String scope) {
+        var request = Lists.newArrayList(subject, domain, object, action, scope);
+        return enforcerCache.get(subject).thenApply(enforcer -> {
+            if (enforcer.isEmpty()) {
+                return false;
+            }
+            return enforcer.get().enforce(request);
+        });
+    }
+
+    private CompletableFuture<Boolean> enforceAdminAccessAsync(String tenantName, String role,
+                                                               AuthenticationDataSource authData) {
+        return isSuperUser(role, authData, config).thenCompose(isSuperUser -> {
+            if (isSuperUser != null && isSuperUser) {
                 return CompletableFuture.completedFuture(true);
             }
-            var request = Lists.newArrayList(role, domain, object, action, scope);
-            return enforcerCache.get(role).thenApply(enforcer -> {
-                if (enforcer.isEmpty()) {
-                    return false;
+            return tenantResources.getTenantAsync(tenantName).thenCompose(op -> {
+                if (op.isPresent()) {
+                    return isTenantAdmin(tenantName, role, op.get(), authData);
+                } else {
+                    return CompletableFuture.completedFuture(false);
                 }
-                return enforcer.get().enforce();
-            }).whenComplete((ok, ex) -> {
-                if (ex != null) {
-                    log.error("Failed to enforce: {}", request);
-                    return;
-                }
-                log.info("Enforce: {} -> {}", request, ok);
             });
         });
     }
 
-    private CompletableFuture<Boolean> enforceAsync(
-            String role,
-            String tenant,
-            String action,
-            String scope,
-            AuthenticationDataSource authenticationData) {
-        return enforceAsync(role, tenant, tenant, action, scope, authenticationData);
+    private CompletableFuture<Boolean> enforceTopicNameAsync(@NonNull String subject, @NonNull TopicName topicName,
+                                                             @NonNull String action, @NonNull String scope,
+                                                             @NonNull AuthenticationDataSource authenticationData) {
+        return enforceAdminAccessAsync(topicName.getTenant(), subject, authenticationData).thenCompose(
+                (isAuthorized) -> {
+                    if (isAuthorized != null && isAuthorized) {
+                        return CompletableFuture.completedFuture(true);
+                    }
+                    return internalEnforceAsync(subject, topicName.getNamespace(), topicName.getPartitionedTopicName(),
+                            action, scope);
+                }).whenComplete((ok, ex) -> {
+            if (ex != null) {
+                log.error("Failed to enforce {}", Lists.newArrayList(subject, topicName, action, scope), ex);
+                return;
+            }
+            if (log.isDebugEnabled()) {
+                log.debug("Enforce {} -> {}", Lists.newArrayList(subject, topicName, action, scope), ok);
+            }
+        });
     }
 
-    private CompletableFuture<Boolean> enforceAsync(
-            String role,
-            TopicName topicName,
-            String action,
-            String scope,
-            AuthenticationDataSource authenticationData) {
-        return enforceAsync(role, topicName.getNamespaceObject().toString(),
-                topicName.getPartitionedTopicName(), action, scope, authenticationData);
+    private CompletableFuture<Boolean> enforceNamespaceAsync(
+            @NonNull String subject,
+            @NonNull NamespaceName namespaceName,
+            @NonNull String object,
+            @NonNull String action,
+            @NonNull AuthenticationDataSource authenticationData) {
+        return enforceAdminAccessAsync(namespaceName.getTenant(), subject, authenticationData).thenCompose(
+                (isAuthorized) -> {
+                    if (isAuthorized != null && isAuthorized) {
+                        return CompletableFuture.completedFuture(true);
+                    }
+                    return internalEnforceAsync(subject, namespaceName.toString(), object, action, DEFAULT_FILL);
+                }).whenComplete((ok, ex) -> {
+            if (ex != null) {
+                log.error("Failed to enforce {}", Lists.newArrayList(subject, namespaceName, action), ex);
+                return;
+            }
+            if (log.isDebugEnabled()) {
+                log.debug("Enforce {} -> {}", Lists.newArrayList(subject, namespaceName, action), ok);
+            }
+        });
     }
 
-    private CompletableFuture<Boolean> enforceAsync(
-            String role,
-            NamespaceName namespaceName,
-            String action,
-            String scope,
-            AuthenticationDataSource authenticationData) {
-        return enforceAsync(role, namespaceName.toString(), namespaceName.toString(), action, scope,
-                authenticationData);
-    }
-
-    private CompletableFuture<Void> addPolicy(Set<String> subjects, TopicName topicName, Set<String> actions,
-                                              String scope) {
+    private CompletableFuture<Void> addPolicy(Set<String> subjects, TopicName topicName, Set<String> actions) {
         var data = subjects.stream()
                 .collect(Collectors.groupingBy(subject -> subject,
                         Collectors.flatMapping(subject -> actions.stream().map(action ->
@@ -273,7 +327,7 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
                                                 topicName.getNamespaceObject().toString(),
                                                 topicName.getPartitionedTopicName(),
                                                 action,
-                                                scope)
+                                                DEFAULT_FILL)
                                 ),
                                 Collectors.toSet())));
         var futures = new ArrayList<CompletableFuture<Void>>();
@@ -287,10 +341,10 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
         return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).whenComplete((__, ex) -> {
             if (ex == null) {
                 log.info("Successfully granted access for role {} on topic {}: {} {}", subjects,
-                        topicName.getPartitionedTopicName(), actions, scope);
+                        topicName.getPartitionedTopicName(), actions, AuthorizationProvider.DEFAULT_FILL);
             } else {
                 log.error("Failed to grant access for role {} on topic {}: {} {}", subjects,
-                        topicName.getPartitionedTopicName(), actions, scope, ex);
+                        topicName.getPartitionedTopicName(), actions, AuthorizationProvider.DEFAULT_FILL, ex);
             }
         });
     }
@@ -304,7 +358,7 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
                                                 TYPE_POLICY,
                                                 subject,
                                                 namespaceName.toString(),
-                                                namespaceName.toString(),
+                                                DEFAULT_FILL,
                                                 action,
                                                 scope)
                                 ),
@@ -348,7 +402,7 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
 
     private CompletableFuture<Void> removePolicy(String subject, NamespaceName namespaceName, String action,
                                                  String scope) {
-        var rule = Lists.newArrayList(TYPE_POLICY, subject, namespaceName.toString(), namespaceName.toString(), action,
+        var rule = Lists.newArrayList(TYPE_POLICY, subject, namespaceName.toString(), DEFAULT_FILL, action,
                 scope);
         return updatePolicy(subject, (policy) -> {
             policy.remove(rule);
@@ -364,27 +418,16 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
         });
     }
 
-    // isSuperUser checks whether given the role exists in superUserRoles from ServiceConfiguration.
-    // Returns true if the role exists, otherwise returns false.
-    @Override
-    public CompletableFuture<Boolean> isSuperUser(
-            String role,
-            AuthenticationDataSource authenticationData,
-            ServiceConfiguration serviceConfiguration) {
-        var superUserRoles = serviceConfiguration.getSuperUserRoles();
-        return CompletableFuture.completedFuture(role != null && superUserRoles.contains(role));
-    }
-
     @Override
     public CompletableFuture<Boolean> canProduceAsync(
             TopicName topicName, String role, AuthenticationDataSource authenticationData) {
-        return enforceAsync(role, topicName, AuthAction.produce.name(), DEFAULT_SCOPE, authenticationData);
+        return enforceTopicNameAsync(role, topicName, AuthAction.produce.name(), DEFAULT_FILL, authenticationData);
     }
 
     @Override
     public CompletableFuture<Boolean> canConsumeAsync(
             TopicName topicName, String role, AuthenticationDataSource authenticationData, String subscription) {
-        return enforceAsync(role, topicName, AuthAction.consume.name(), subscription, authenticationData);
+        return enforceTopicNameAsync(role, topicName, AuthAction.consume.name(), subscription, authenticationData);
     }
 
     @Override
@@ -394,22 +437,22 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
             if (produceAuthorized) {
                 return CompletableFuture.completedFuture(true);
             }
-            return canConsumeAsync(topicName, role, authenticationData, null);
+            return canConsumeAsync(topicName, role, authenticationData, DEFAULT_FILL);
         });
     }
 
     @Override
     public CompletableFuture<Void> grantPermissionAsync(
             TopicName topicName, Set<AuthAction> actions, String role, String authDataJson) {
-        return addPolicy(Sets.newHashSet(role), topicName, actions.stream().map(Enum::name).collect(Collectors.toSet()),
-                DEFAULT_SCOPE);
+        return addPolicy(Sets.newHashSet(role), topicName,
+                actions.stream().map(Enum::name).collect(Collectors.toSet()));
     }
 
     @Override
     public CompletableFuture<Void> grantPermissionAsync(
             NamespaceName namespaceName, Set<AuthAction> actions, String role, String authDataJson) {
         return addPolicy(Sets.newHashSet(role), namespaceName,
-                actions.stream().map(Enum::name).collect(Collectors.toSet()), DEFAULT_SCOPE);
+                actions.stream().map(Enum::name).collect(Collectors.toSet()), DEFAULT_FILL);
     }
 
     @Override
@@ -427,20 +470,20 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
     @Override
     public CompletableFuture<Boolean> allowFunctionOpsAsync(
             NamespaceName namespaceName, String role, AuthenticationDataSource authenticationData) {
-        return enforceAsync(role, namespaceName, AuthAction.functions.name(), DEFAULT_SCOPE,
+        return enforceNamespaceAsync(role, namespaceName, DEFAULT_FILL, AuthAction.functions.name(),
                 authenticationData);
     }
 
     @Override
     public CompletableFuture<Boolean> allowSourceOpsAsync(
             NamespaceName namespaceName, String role, AuthenticationDataSource authenticationData) {
-        return enforceAsync(role, namespaceName, AuthAction.sources.name(), DEFAULT_SCOPE, authenticationData);
+        return enforceNamespaceAsync(role, namespaceName, DEFAULT_FILL, AuthAction.sources.name(), authenticationData);
     }
 
     @Override
     public CompletableFuture<Boolean> allowSinkOpsAsync(
             NamespaceName namespaceName, String role, AuthenticationDataSource authenticationData) {
-        return enforceAsync(role, namespaceName, AuthAction.sinks.name(), DEFAULT_SCOPE, authenticationData);
+        return enforceNamespaceAsync(role, namespaceName, DEFAULT_FILL, AuthAction.sinks.name(), authenticationData);
     }
 
     @Override
@@ -449,7 +492,21 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
             String role,
             TenantOperation operation,
             AuthenticationDataSource authData) {
-        return enforceAsync(role, tenantName, tenantName, operation.name(), DEFAULT_SCOPE, authData);
+        return enforceAdminAccessAsync(tenantName, role, authData).thenCompose(
+                (isAuthorized) -> {
+                    if (isAuthorized != null && isAuthorized) {
+                        return CompletableFuture.completedFuture(true);
+                    }
+                    return internalEnforceAsync(role, tenantName, DEFAULT_FILL, operation.name(), DEFAULT_FILL);
+                }).whenComplete((ok, ex) -> {
+            if (ex != null) {
+                log.error("Failed to enforce {}", Lists.newArrayList(role, tenantName, operation), ex);
+                return;
+            }
+            if (log.isDebugEnabled()) {
+                log.debug("Enforce {} -> {}", Lists.newArrayList(role, tenantName, operation), ok);
+            }
+        });
     }
 
     @Override
@@ -459,8 +516,7 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
             PolicyOperation operation,
             String role,
             AuthenticationDataSource authData) {
-        return enforceAsync(role, namespaceName.getNamespaceObject().toString(), policy.name(), operation.name(),
-                authData);
+        return enforceNamespaceAsync(role, namespaceName, policy.name(), operation.name(), authData);
     }
 
     @Override
@@ -468,33 +524,37 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
                                                                String role,
                                                                TopicOperation operation,
                                                                AuthenticationDataSource authData) {
-        switch (operation) {
-            case LOOKUP:
-            case GET_STATS:
-                return canLookupAsync(topicName, role, authData);
-            case PRODUCE:
-                return canProduceAsync(topicName, role, authData);
-            case GET_SUBSCRIPTIONS:
-            case CONSUME:
-            case SUBSCRIBE:
-            case UNSUBSCRIBE:
-            case SKIP:
-            case EXPIRE_MESSAGES:
-            case PEEK_MESSAGES:
-            case RESET_CURSOR:
-            case SET_REPLICATED_SUBSCRIPTION_STATUS:
-                return canConsumeAsync(topicName, role, authData, authData.getSubscription());
-            case TERMINATE:
-            case COMPACT:
-            case OFFLOAD:
-            case UNLOAD:
-            case ADD_BUNDLE_RANGE:
-            case GET_BUNDLE_RANGE:
-            case DELETE_BUNDLE_RANGE:
-            default:
-                return enforceAsync(role, topicName, operation.name(), DEFAULT_SCOPE, authData);
-        }
-
+        return enforceTopicNameAsync(role, topicName, operation.name(), DEFAULT_FILL, authData).thenCompose(ok -> {
+            if (ok != null && ok) {
+                return CompletableFuture.completedFuture(true);
+            }
+            switch (operation) {
+                case LOOKUP:
+                case GET_STATS:
+                    return canLookupAsync(topicName, role, authData);
+                case PRODUCE:
+                    return canProduceAsync(topicName, role, authData);
+                case GET_SUBSCRIPTIONS:
+                case CONSUME:
+                case SUBSCRIBE:
+                case UNSUBSCRIBE:
+                case SKIP:
+                case EXPIRE_MESSAGES:
+                case PEEK_MESSAGES:
+                case RESET_CURSOR:
+                case SET_REPLICATED_SUBSCRIPTION_STATUS:
+                    return canConsumeAsync(topicName, role, authData, authData.getSubscription());
+                case TERMINATE:
+                case COMPACT:
+                case OFFLOAD:
+                case UNLOAD:
+                case ADD_BUNDLE_RANGE:
+                case GET_BUNDLE_RANGE:
+                case DELETE_BUNDLE_RANGE:
+                default:
+                    return CompletableFuture.completedFuture(false);
+            }
+        });
     }
 
     @Override
@@ -503,48 +563,46 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
                                                                      PolicyName policyName,
                                                                      PolicyOperation policyOperation,
                                                                      AuthenticationDataSource authData) {
-        return enforceAsync(role, topicName.getNamespaceObject().toString(), topicName.getPartitionedTopicName(),
-                policyName.name(), policyOperation.name(), authData);
+        return enforceTopicNameAsync(role, topicName, policyName.name(), policyOperation.name(), authData);
     }
 
     @Override
     public CompletableFuture<Boolean> allowNamespaceOperationAsync(NamespaceName namespaceName, String role,
                                                                    NamespaceOperation operation,
                                                                    AuthenticationDataSource authData) {
-        switch (operation) {
-            case PACKAGES:
-                return enforceAsync(role, namespaceName, AuthAction.packages.name(), DEFAULT_SCOPE, authData);
-            case GET_TOPIC:
-            case GET_TOPICS:
-            case GET_BUNDLE:
-                return enforceAsync(role, namespaceName, AuthAction.consume.name(), DEFAULT_SCOPE, authData)
-                        .thenCompose((n) -> enforceAsync(role, namespaceName, AuthAction.produce.name(), DEFAULT_SCOPE,
-                                authData));
-            case UNSUBSCRIBE:
-            case CLEAR_BACKLOG:
-                return enforceAsync(role, namespaceName, AuthAction.consume.name(), DEFAULT_SCOPE, authData);
-            case CREATE_TOPIC:
-            case DELETE_TOPIC:
-            case ADD_BUNDLE:
-            case DELETE_BUNDLE:
-            case GRANT_PERMISSION:
-            case GET_PERMISSION:
-            case REVOKE_PERMISSION:
-            default:
-                return enforceAsync(role, namespaceName, operation.name(), DEFAULT_SCOPE, authData);
-        }
+        return enforceNamespaceAsync(role, namespaceName, DEFAULT_FILL, operation.name(), authData).thenCompose(ok -> {
+            if (ok != null && ok) {
+                return CompletableFuture.completedFuture(true);
+            }
+
+            switch (operation) {
+                case PACKAGES:
+                    return enforceNamespaceAsync(role, namespaceName, DEFAULT_FILL, AuthAction.packages.name(),
+                            authData);
+                case GET_TOPIC:
+                case GET_TOPICS:
+                case GET_BUNDLE:
+                    return enforceNamespaceAsync(role, namespaceName, DEFAULT_FILL, AuthAction.consume.name(),
+                            authData).thenCompose(
+                            (n) -> enforceNamespaceAsync(role, namespaceName, DEFAULT_FILL,
+                                    AuthAction.produce.name(), authData));
+                case UNSUBSCRIBE:
+                case CLEAR_BACKLOG:
+                    return enforceNamespaceAsync(role, namespaceName, DEFAULT_FILL, AuthAction.consume.name(),
+                            authData);
+                case CREATE_TOPIC:
+                case DELETE_TOPIC:
+                case ADD_BUNDLE:
+                case DELETE_BUNDLE:
+                case GRANT_PERMISSION:
+                case GET_PERMISSION:
+                case REVOKE_PERMISSION:
+                default:
+                    return CompletableFuture.completedFuture(false);
+            }
+        });
     }
 
-    /**
-     * Closes this stream and releases any system resources associated with it. If the stream is
-     * already closed then invoking this method has no effect.
-     *
-     * <p>As noted in {@link AutoCloseable#close()}, cases where the close may fail require careful
-     * attention. It is strongly advised to relinquish the underlying resources and to internally
-     * <em>mark</em> the {@code Closeable} as closed, prior to throwing the {@code IOException}.
-     *
-     * @throws IOException if an I/O error occurs
-     */
     @Override
     public void close() throws IOException {
     }
