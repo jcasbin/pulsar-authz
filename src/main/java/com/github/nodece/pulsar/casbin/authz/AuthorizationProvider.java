@@ -43,7 +43,9 @@ import org.casbin.jcasbin.model.Model;
 
 @Slf4j
 public class AuthorizationProvider implements org.apache.pulsar.broker.authorization.AuthorizationProvider {
-    public static final String DEFAULT_WILDCARD = "*";
+    private static final String DEFAULT_SCOPE = "*";
+    private static final String TYPE_POLICY = "p";
+    private static final String TYPE_GROUPING_POLICY = "g";
     private ServiceConfiguration config = null;
     private MetadataStore metadataStore;
     private String metadataBasePath = "casbin";
@@ -131,7 +133,19 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
             var m = new Model();
             m.loadModelFromText(modelText);
             var e = new SyncedEnforcer(m);
-            policy.forEach(e::addPolicy);
+            policy.forEach(n -> {
+                var type = n.get(0);
+                switch (type) {
+                    case TYPE_POLICY:
+                        e.addPolicy(n);
+                        break;
+                    case TYPE_GROUPING_POLICY:
+                        e.addGroupingPolicy(n);
+                        break;
+                    default:
+                        throw new IllegalArgumentException("Policy type " + type + " is supported");
+                }
+            });
             return Optional.of(e);
         });
     }
@@ -174,7 +188,7 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
             if (n) {
                 return CompletableFuture.completedFuture(true);
             }
-            var request = List.of(role, domain, object, action, scope);
+            var request = Lists.newArrayList(role, domain, object, action, scope);
             return enforcerCache.get(role).thenApply(enforcer -> {
                 if (enforcer.isEmpty()) {
                     return false;
@@ -224,14 +238,16 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
         var data = subjects.stream()
                 .collect(Collectors.groupingBy(subject -> subject,
                         Collectors.flatMapping(subject -> actions.stream().map(action ->
-                                        Lists.newArrayList(subject,
+                                        Lists.newArrayList(
+                                                TYPE_POLICY,
+                                                subject,
                                                 topicName.getNamespaceObject().toString(),
                                                 topicName.getPartitionedTopicName(),
                                                 action,
                                                 scope)
                                 ),
                                 Collectors.toSet())));
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        var futures = new ArrayList<CompletableFuture<Void>>();
         data.forEach((key, value) -> {
             futures.add(updatePolicy(key, policy -> {
                 policy.addAll(value);
@@ -256,6 +272,7 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
                 .collect(Collectors.groupingBy(subject -> subject,
                         Collectors.flatMapping(subject -> actions.stream().map(action ->
                                         Lists.newArrayList(
+                                                TYPE_POLICY,
                                                 subject,
                                                 namespaceName.toString(),
                                                 namespaceName.toString(),
@@ -263,7 +280,7 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
                                                 scope)
                                 ),
                                 Collectors.toSet())));
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        var futures = new ArrayList<CompletableFuture<Void>>();
         data.forEach((key, value) -> {
             futures.add(updatePolicy(key, policy -> {
                 policy.addAll(value);
@@ -284,9 +301,8 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
 
     private CompletableFuture<Void> removePolicy(String subject, TopicName topicName, String action,
                                                  String scope) {
-        List<String> rule =
-                List.of(subject, topicName.getNamespaceObject().toString(), topicName.getPartitionedTopicName(), action,
-                        scope);
+        List<String> rule = Lists.newArrayList(TYPE_POLICY, subject, topicName.getNamespaceObject().toString(),
+                topicName.getPartitionedTopicName(), action, scope);
         return updatePolicy(subject, (policy) -> {
             policy.remove(rule);
             return policy;
@@ -303,7 +319,8 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
 
     private CompletableFuture<Void> removePolicy(String subject, NamespaceName namespaceName, String action,
                                                  String scope) {
-        List<String> rule = List.of(subject, namespaceName.toString(), namespaceName.toString(), action, scope);
+        var rule = Lists.newArrayList(TYPE_POLICY, subject, namespaceName.toString(), namespaceName.toString(), action,
+                scope);
         return updatePolicy(subject, (policy) -> {
             policy.remove(rule);
             return policy;
@@ -325,20 +342,20 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
             String role,
             AuthenticationDataSource authenticationData,
             ServiceConfiguration serviceConfiguration) {
-        Set<String> superUserRoles = serviceConfiguration.getSuperUserRoles();
+        var superUserRoles = serviceConfiguration.getSuperUserRoles();
         return CompletableFuture.completedFuture(role != null && superUserRoles.contains(role));
     }
 
     @Override
     public CompletableFuture<Boolean> canProduceAsync(
             TopicName topicName, String role, AuthenticationDataSource authenticationData) {
-        return this.enforceAsync(role, topicName, AuthAction.produce.name(), DEFAULT_WILDCARD, authenticationData);
+        return enforceAsync(role, topicName, AuthAction.produce.name(), DEFAULT_SCOPE, authenticationData);
     }
 
     @Override
     public CompletableFuture<Boolean> canConsumeAsync(
             TopicName topicName, String role, AuthenticationDataSource authenticationData, String subscription) {
-        return this.enforceAsync(role, topicName, AuthAction.consume.name(), subscription, authenticationData);
+        return enforceAsync(role, topicName, AuthAction.consume.name(), subscription, authenticationData);
     }
 
     @Override
@@ -356,21 +373,20 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
     public CompletableFuture<Void> grantPermissionAsync(
             TopicName topicName, Set<AuthAction> actions, String role, String authDataJson) {
         return addPolicy(Sets.newHashSet(role), topicName, actions.stream().map(Enum::name).collect(Collectors.toSet()),
-                DEFAULT_WILDCARD);
+                DEFAULT_SCOPE);
     }
 
     @Override
     public CompletableFuture<Void> grantPermissionAsync(
             NamespaceName namespaceName, Set<AuthAction> actions, String role, String authDataJson) {
         return addPolicy(Sets.newHashSet(role), namespaceName,
-                actions.stream().map(Enum::name).collect(Collectors.toSet()),
-                DEFAULT_WILDCARD);
+                actions.stream().map(Enum::name).collect(Collectors.toSet()), DEFAULT_SCOPE);
     }
 
     @Override
     public CompletableFuture<Void> grantSubscriptionPermissionAsync(
             NamespaceName namespace, String subscriptionName, Set<String> roles, String authDataJson) {
-        return addPolicy(roles, namespace, Sets.newHashSet(AuthAction.consume.name()), DEFAULT_WILDCARD);
+        return addPolicy(roles, namespace, Sets.newHashSet(AuthAction.consume.name()), subscriptionName);
     }
 
     @Override
@@ -382,20 +398,20 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
     @Override
     public CompletableFuture<Boolean> allowFunctionOpsAsync(
             NamespaceName namespaceName, String role, AuthenticationDataSource authenticationData) {
-        return enforceAsync(role, namespaceName, AuthAction.functions.name(), DEFAULT_WILDCARD,
+        return enforceAsync(role, namespaceName, AuthAction.functions.name(), DEFAULT_SCOPE,
                 authenticationData);
     }
 
     @Override
     public CompletableFuture<Boolean> allowSourceOpsAsync(
             NamespaceName namespaceName, String role, AuthenticationDataSource authenticationData) {
-        return enforceAsync(role, namespaceName, AuthAction.sources.name(), DEFAULT_WILDCARD, authenticationData);
+        return enforceAsync(role, namespaceName, AuthAction.sources.name(), DEFAULT_SCOPE, authenticationData);
     }
 
     @Override
     public CompletableFuture<Boolean> allowSinkOpsAsync(
             NamespaceName namespaceName, String role, AuthenticationDataSource authenticationData) {
-        return enforceAsync(role, namespaceName, AuthAction.sinks.name(), DEFAULT_WILDCARD, authenticationData);
+        return enforceAsync(role, namespaceName, AuthAction.sinks.name(), DEFAULT_SCOPE, authenticationData);
     }
 
     @Override
@@ -404,7 +420,7 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
             String role,
             TenantOperation operation,
             AuthenticationDataSource authData) {
-        return enforceAsync(role, tenantName, tenantName, operation.name(), DEFAULT_WILDCARD, authData);
+        return enforceAsync(role, tenantName, tenantName, operation.name(), DEFAULT_SCOPE, authData);
     }
 
     @Override
@@ -448,7 +464,7 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
             case ADD_BUNDLE_RANGE:
             case GET_BUNDLE_RANGE:
             case DELETE_BUNDLE_RANGE:
-                return enforceAsync(role, topicName, operation.name(), DEFAULT_WILDCARD, authData);
+                return enforceAsync(role, topicName, operation.name(), DEFAULT_SCOPE, authData);
             default:
                 return FutureUtil.failedFuture(
                         new IllegalStateException("TopicOperation [" + operation.name() + "] is not supported."));
