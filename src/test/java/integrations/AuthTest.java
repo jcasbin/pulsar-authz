@@ -1,8 +1,5 @@
-package com.github.nodece.pulsar.casbin.authz;
+package integrations;
 
-import static org.assertj.core.api.Assertions.assertThat;
-import java.nio.charset.StandardCharsets;
-import java.util.Random;
 import lombok.Cleanup;
 import org.apache.pulsar.client.admin.PulsarAdmin;
 import org.apache.pulsar.client.api.PulsarClient;
@@ -13,6 +10,12 @@ import org.apache.pulsar.common.policies.data.TenantInfo;
 import org.testng.annotations.Test;
 import org.testng.collections.Sets;
 
+import java.nio.charset.StandardCharsets;
+import java.util.Random;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+@Test(groups = "integrations")
 public class AuthTest {
     private final String ADMIN_TOKEN =
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZG1pbiJ9.mAEZVpz87oZ7vXsqLl-Ue8P9I4SOhqIF7nf8n1f5TZc";

@@ -1,7 +1,12 @@
-# pulsar-casbin-authz
+# Pulsar-authz
 
-An authorization plugin for pulsar broker based on casbin.
+An authorization plugin for Apache Pulsar.
 
-## TODO
+**Note:** This plugin requires Pulsar 2.9 or higher.
 
-- [ ] add integration tests
+### Enable Casbin authorization on Broker
+
+```ini
+authorizationEnabled=true
+authorizationProvider=org.casbin.pulsar.authorization.AuthorizationProvider
+```

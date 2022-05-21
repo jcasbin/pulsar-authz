@@ -1,4 +1,4 @@
-package com.github.nodece.pulsar.casbin.authz;
+package org.casbin.pulsar.authorization;
 
 import static com.google.common.base.Preconditions.checkNotNull;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -341,10 +341,10 @@ public class AuthorizationProvider implements org.apache.pulsar.broker.authoriza
         return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).whenComplete((__, ex) -> {
             if (ex == null) {
                 log.info("Successfully granted access for role {} on topic {}: {} {}", subjects,
-                        topicName.getPartitionedTopicName(), actions, AuthorizationProvider.DEFAULT_FILL);
+                        topicName.getPartitionedTopicName(), actions, DEFAULT_FILL);
             } else {
                 log.error("Failed to grant access for role {} on topic {}: {} {}", subjects,
-                        topicName.getPartitionedTopicName(), actions, AuthorizationProvider.DEFAULT_FILL, ex);
+                        topicName.getPartitionedTopicName(), actions, DEFAULT_FILL, ex);
             }
         });
     }

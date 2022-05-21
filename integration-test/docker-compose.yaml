@@ -1,10 +1,12 @@
 version: "2.4"
 services:
-  pulsar-casbin-authz-intergation-test:
-    container_name: pulsar-casbin-authz-intergation-test
+  casbin-pulsar-authz-intergation-test:
+    container_name: casbin-pulsar-authz-intergation-test
     build:
       context: ../
       dockerfile: integration-test/Dockerfile
+      args:
+        PULSAR_VERSION: ${PULSAR_VERSION}
     ports:
       - 8080:8080
       - 6650:6650

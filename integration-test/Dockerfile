@@ -1,4 +1,5 @@
-FROM apachepulsar/pulsar:latest
+ARG PULSAR_VERSION
+FROM apachepulsar/pulsar:$PULSAR_VERSION
 
 COPY target/*-shade.jar /pulsar/lib/
 COPY integration-test/my-secret.key /pulsar/conf/

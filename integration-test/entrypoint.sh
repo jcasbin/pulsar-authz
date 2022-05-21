@@ -8,7 +8,7 @@ export PULSAR_PREFIX_tokenSecretKey=file:///pulsar/conf/my-secret.key
 # authorization for broker
 export PULSAR_PREFIX_authorizationEnabled=true
 export PULSAR_PREFIX_superUserRoles=admin
-export PULSAR_PREFIX_authorizationProvider=com.github.nodece.pulsar.casbin.authz.AuthorizationProvider
+export PULSAR_PREFIX_authorizationProvider=org.casbin.pulsar.authorization.AuthorizationProvider
 
 # authorization for client
 export PULSAR_PREFIX_brokerClientAuthenticationPlugin=org.apache.pulsar.client.impl.auth.AuthenticationToken
