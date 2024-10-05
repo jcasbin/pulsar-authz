@@ -2,7 +2,7 @@
 
 An authorization plugin for Apache Pulsar.
 
-**Note:** This plugin requires Pulsar 2.9 or higher. 
+**Note:** This plugin requires Pulsar 2.9 or higher.
 
 ### Enable Casbin authorization on Broker
 
