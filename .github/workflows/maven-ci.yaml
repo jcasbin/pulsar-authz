@@ -21,6 +21,11 @@ jobs:
       - name: Build
         run: mvn -B clean package -DskipTests
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: 20
+
       - name: Semantic Release
         run: |
           npm install -g @conveyal/maven-semantic-release semantic-release
