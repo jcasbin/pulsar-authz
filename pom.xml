@@ -58,7 +58,7 @@
         <casbin.version>1.15.0</casbin.version>
         <pulsar.version>2.10.0</pulsar.version>
         <caffeine.version>3.1.0</caffeine.version>
-        <guava.version>31.1-jre</guava.version>
+        <guava.version>32.0.0-jre</guava.version>
         <jackson.databind.version>2.13.3</jackson.databind.version>
 
         <!-- test dependencies -->
