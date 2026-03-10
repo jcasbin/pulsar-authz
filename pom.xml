@@ -56,7 +56,7 @@
         <maven.compiler.source>11</maven.compiler.source>
         <maven.compiler.target>11</maven.compiler.target>
         <casbin.version>1.15.0</casbin.version>
-        <pulsar.version>2.10.0</pulsar.version>
+        <pulsar.version>3.0.4</pulsar.version>
         <caffeine.version>3.1.0</caffeine.version>
         <guava.version>31.1-jre</guava.version>
         <jackson.databind.version>2.13.3</jackson.databind.version>
