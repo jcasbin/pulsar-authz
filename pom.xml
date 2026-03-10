@@ -62,7 +62,7 @@
         <jackson.databind.version>2.13.3</jackson.databind.version>
 
         <!-- test dependencies -->
-        <testng.version>7.6.0</testng.version>
+        <testng.version>7.7.0</testng.version>
         <mockito.version>2.22.0</mockito.version>
         <lombok.version>1.18.22</lombok.version>
         <awaitility.version>4.1.0</awaitility.version>
